@@ -164,6 +164,85 @@ describe('PDF to Word Engine — Layout & Reconstruction Algorithms', () => {
     expect(lines[2].listBullet).toBe('1.');
   });
 
+  it('detects resume uppercase section headings and separates right-aligned dates with tabs', () => {
+    const pageWidth = 600;
+    const items: ExtractedTextItem[] = [
+      // Left-aligned all-caps section header with standard 11pt font
+      {
+        str: 'FEATURED PROJECTS',
+        x: 40,
+        y: 600,
+        width: 130,
+        height: 11,
+        fontSize: 11,
+        fontFamily: 'Calibri',
+        isBold: true,
+        isItalic: false
+      },
+      // Project title on left, date on right (wide horizontal gap)
+      {
+        str: 'E-Sekolah SaaS Platform',
+        x: 40,
+        y: 575,
+        width: 150,
+        height: 11,
+        fontSize: 11,
+        fontFamily: 'Calibri',
+        isBold: true,
+        isItalic: false
+      },
+      {
+        str: '2026',
+        x: 520,
+        y: 575,
+        width: 30,
+        height: 11,
+        fontSize: 11,
+        fontFamily: 'Calibri',
+        isBold: false,
+        isItalic: false
+      },
+      // Bullet item with symbol bullet
+      {
+        str: '•',
+        x: 40,
+        y: 550,
+        width: 5,
+        height: 11,
+        fontSize: 11,
+        fontFamily: 'Calibri',
+        isBold: false,
+        isItalic: false
+      },
+      {
+        str: 'Engineered real-time QR attendance verification system',
+        x: 55,
+        y: 550,
+        width: 300,
+        height: 11,
+        fontSize: 11,
+        fontFamily: 'Calibri',
+        isBold: false,
+        isItalic: false
+      }
+    ];
+
+    const lines = groupItemsIntoLines(items, pageWidth);
+    expect(lines).toHaveLength(3);
+
+    // Section header
+    expect(lines[0].text).toBe('FEATURED PROJECTS');
+    expect(lines[0].isHeading).toBe(true);
+
+    // Project title with tabbed date
+    expect(lines[1].text).toContain('E-Sekolah SaaS Platform');
+    expect(lines[1].text).toContain('\t2026');
+
+    // Bullet item
+    expect(lines[2].isListItem).toBe(true);
+    expect(lines[2].text).toContain('Engineered real-time QR attendance');
+  });
+
   it('detects grid-aligned tabular rows and extracts them as DetectedTable', () => {
     const pageWidth = 600;
     // 3 rows of 3 columns

@@ -30,35 +30,32 @@ export function isInAppBrowser(): boolean {
  * Downloads a Blob reliably across desktop, mobile browsers, iOS Safari, and WebViews.
  */
 export async function downloadBlob(blob: Blob, filename: string): Promise<void> {
-  const mimeType = blob.type || 'application/octet-stream';
-  const safeBlob = blob.type ? blob : new Blob([blob], { type: mimeType });
-
-  const isMobile = typeof navigator !== 'undefined' && /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
-  const inApp = isInAppBrowser();
-
-  // If running inside an in-app browser (WhatsApp, Instagram, etc.), standard <a> downloads
-  // are almost always blocked by the host app's WebView.
-  // The Web Share API is often the only way to allow saving directly to device/files on mobile.
-  if (isMobile && typeof navigator.share === 'function') {
-    try {
-      const file = new File([safeBlob], filename, { type: mimeType });
-      if (navigator.canShare && navigator.canShare({ files: [file] })) {
-        await navigator.share({
-          files: [file],
-          title: filename
-        });
-        return;
-      }
-    } catch (shareErr: unknown) {
-      // If user deliberately cancelled the native share sheet, do not force secondary download
-      if (shareErr instanceof Error && shareErr.name === 'AbortError') {
-        return;
-      }
-      // Otherwise, fall through to <a> tag download
+  let mimeType = blob.type;
+  if (!mimeType || mimeType === 'application/octet-stream') {
+    const lowerName = filename.toLowerCase();
+    if (lowerName.endsWith('.docx')) {
+      mimeType = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+    } else if (lowerName.endsWith('.pdf')) {
+      mimeType = 'application/pdf';
+    } else if (lowerName.endsWith('.zip')) {
+      mimeType = 'application/zip';
+    } else if (lowerName.endsWith('.jpg') || lowerName.endsWith('.jpeg')) {
+      mimeType = 'image/jpeg';
+    } else if (lowerName.endsWith('.png')) {
+      mimeType = 'image/png';
+    } else if (lowerName.endsWith('.webp')) {
+      mimeType = 'image/webp';
+    } else {
+      mimeType = 'application/octet-stream';
     }
   }
+  const safeBlob = new Blob([blob], { type: mimeType });
 
-  // Primary standard web download via temporary <a> element
+  const inApp = isInAppBrowser();
+
+  // Primary standard direct file download via temporary <a> element
+  // Directly downloads the file with the exact filename extension (.docx, .jpg, .pdf)
+  // instead of invoking the Android Share Sheet which renames OpenXML docs to .zip.
   const url = URL.createObjectURL(safeBlob);
   const link = document.createElement('a');
   link.href = url;

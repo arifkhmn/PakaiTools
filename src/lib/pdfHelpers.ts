@@ -172,7 +172,12 @@ export async function compressPdfDocument(
   savedPercent: number;
 }> {
   const fileBuffer = await pdfFile.arrayBuffer();
-  const loadingTask = pdfjsLib.getDocument({ data: fileBuffer });
+  const loadingTask = pdfjsLib.getDocument({
+    data: fileBuffer,
+    cMapUrl: `https://unpkg.com/pdfjs-dist@${pdfjsLib.version}/cmaps/`,
+    cMapPacked: true,
+    standardFontDataUrl: `https://unpkg.com/pdfjs-dist@${pdfjsLib.version}/standard_fonts/`
+  });
   const pdfDoc = await loadingTask.promise;
   const numPages = pdfDoc.numPages;
 

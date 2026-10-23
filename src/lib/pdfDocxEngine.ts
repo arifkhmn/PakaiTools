@@ -10,9 +10,19 @@ import {
   TableRow,
   TableCell,
   WidthType,
-  BorderStyle
+  BorderStyle,
+  TabStopType
 } from 'docx';
 import { pdfjsLib } from './pdfWorkerSetup';
+
+/**
+ * Strips XML 1.0 illegal characters (control characters such as \x00, \x0c, \x0b, etc.)
+ * which frequently occur in PDF streams and break Microsoft Word / WPS Office OOXML parsing.
+ */
+export function sanitizeXmlString(str: string): string {
+  if (!str) return '';
+  return str.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\uFFFE\uFFFF]/g, '');
+}
 
 // --- Interfaces & Types ---
 
@@ -151,23 +161,73 @@ export class ConversionCancelledError extends Error {
 // --- Image Processing Helpers ---
 
 export async function rawPdfImageToPngBytes(imgObj: {
-  width: number;
-  height: number;
+  width?: number;
+  height?: number;
   kind?: number;
-  data: Uint8Array | Uint8ClampedArray;
-}): Promise<Uint8Array | null> {
+  data?: Uint8Array | Uint8ClampedArray;
+  bitmap?: ImageBitmap;
+} | any): Promise<Uint8Array | null> {
   if (typeof document === 'undefined') return null;
   try {
+    const width = imgObj?.width || (imgObj?.bitmap && imgObj.bitmap.width) || 0;
+    const height = imgObj?.height || (imgObj?.bitmap && imgObj.bitmap.height) || 0;
+
+    // Fast-path: Modern PDF.js ImageBitmap
+    if (imgObj?.bitmap) {
+      const bmp = imgObj.bitmap;
+      const bWidth = bmp.width || width;
+      const bHeight = bmp.height || height;
+      if (!bWidth || !bHeight) return null;
+
+      const canvas = document.createElement('canvas');
+      canvas.width = bWidth;
+      canvas.height = bHeight;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return null;
+
+      ctx.drawImage(bmp, 0, 0);
+      return new Promise<Uint8Array | null>((resolve) => {
+        canvas.toBlob((blob) => {
+          if (!blob) return resolve(null);
+          blob
+            .arrayBuffer()
+            .then((buf) => resolve(new Uint8Array(buf)))
+            .catch(() => resolve(null));
+        }, 'image/png');
+      });
+    }
+
+    if (typeof ImageBitmap !== 'undefined' && imgObj instanceof ImageBitmap) {
+      const canvas = document.createElement('canvas');
+      canvas.width = imgObj.width;
+      canvas.height = imgObj.height;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return null;
+
+      ctx.drawImage(imgObj, 0, 0);
+      return new Promise<Uint8Array | null>((resolve) => {
+        canvas.toBlob((blob) => {
+          if (!blob) return resolve(null);
+          blob
+            .arrayBuffer()
+            .then((buf) => resolve(new Uint8Array(buf)))
+            .catch(() => resolve(null));
+        }, 'image/png');
+      });
+    }
+
+    if (!width || !height || !imgObj?.data) return null;
+
     const canvas = document.createElement('canvas');
-    canvas.width = imgObj.width;
-    canvas.height = imgObj.height;
+    canvas.width = width;
+    canvas.height = height;
     const ctx = canvas.getContext('2d');
     if (!ctx) return null;
 
-    const imgData = ctx.createImageData(imgObj.width, imgObj.height);
+    const imgData = ctx.createImageData(width, height);
     const src = imgObj.data;
     const dest = imgData.data;
-    const totalPixels = imgObj.width * imgObj.height;
+    const totalPixels = width * height;
 
     if (imgObj.kind === 2) {
       // RGB (24bpp)
@@ -290,7 +350,12 @@ export async function inspectPdfDocument(
 
   let pdfDoc: any;
   try {
-    const loadingTask = pdfjsLib.getDocument({ data: dataBuffer });
+    const loadingTask = pdfjsLib.getDocument({
+      data: dataBuffer,
+      cMapUrl: `https://unpkg.com/pdfjs-dist@${pdfjsLib.version}/cmaps/`,
+      cMapPacked: true,
+      standardFontDataUrl: `https://unpkg.com/pdfjs-dist@${pdfjsLib.version}/standard_fonts/`
+    });
     pdfDoc = await loadingTask.promise;
   } catch (err: any) {
     if (err && (err.name === 'PasswordException' || err.code === 1)) {
@@ -441,8 +506,14 @@ export function parsePageTextItems(
       else if (/courier|mono/i.test(fontDesc)) fontFamily = 'Courier New';
       else if (/georgia/i.test(fontDesc)) fontFamily = 'Georgia';
 
+      // Normalize private bullet symbols (e.g., \uF0B7 from Symbol/Wingdings font) to standard •
+      let cleanStr = sanitizeXmlString(it.str);
+      if (/^[\uF0B7\uF0A7\uF0A8\uE000-\uF8FF]$/.test(cleanStr.trim())) {
+        cleanStr = '•';
+      }
+
       return {
-        str: it.str,
+        str: cleanStr,
         x: it.transform?.[4] ?? 0,
         y: it.transform?.[5] ?? 0,
         width: it.width ?? 0,
@@ -473,8 +544,12 @@ export function orderItemsByColumns(
     (it) => (it.x < gutterLeft && it.x + it.width > gutterRight) || it.width > pageWidthPt * 0.65
   );
 
-  // If both columns have significant content, partition into logical blocks
-  if (leftColItems.length >= 10 && rightColItems.length >= 10) {
+  const rightColAvgWidth =
+    rightColItems.reduce((acc, it) => acc + it.width, 0) / (rightColItems.length || 1);
+  const isGenuineRightCol = rightColItems.length >= 10 && rightColAvgWidth > 85;
+
+  // If both columns have genuine content (not just right-aligned dates/years), partition into logical blocks
+  if (leftColItems.length >= 10 && isGenuineRightCol) {
     const minYCol = Math.min(
       Math.min(...leftColItems.map((i) => i.y)),
       Math.min(...rightColItems.map((i) => i.y))
@@ -549,7 +624,9 @@ export function groupItemsIntoLines(
 
         if (/\s$/.test(assembledText) || /^\s/.test(it.str)) {
           assembledText += it.str;
-        } else if (gap > Math.max(2.5, avgCharWidth * 0.35)) {
+        } else if (gap > 35 && it.x > pageWidthPt * 0.5) {
+          assembledText += '\t' + it.str;
+        } else if (gap > Math.max(1.8, avgCharWidth * 0.22)) {
           assembledText += ' ' + it.str;
         } else {
           assembledText += it.str;
@@ -577,14 +654,28 @@ export function groupItemsIntoLines(
       alignment = AlignmentType.RIGHT;
     }
 
-    const isLargeHeading = maxFontSize >= 17;
-    const isMediumHeading = maxFontSize >= 13.5 && maxFontSize < 17;
+    const cleanLine = assembledText.replace(/\t/g, ' ').trim();
+    const isLargeHeading = maxFontSize >= 16;
+    const isMediumHeading = maxFontSize >= 13 && maxFontSize < 16;
+
+    // Detect resume and document section headers (e.g., PROFESSIONAL SUMMARY, TECHNICAL SKILLS, FEATURED PROJECTS, EDUCATION)
+    const isAllCaps =
+      /^[A-Z0-9\s&—\-_–\/,.()|]{3,75}$/.test(cleanLine) && /[A-Z]{3,}/.test(cleanLine);
+    const isCommonSectionTitle =
+      /^(professional\s+summary|summary|profile|about\s+me|technical\s+skills|skills|work\s+experience|experience|employment|work\s+history|projects|featured\s+projects|education|certifications|awards|honors|publications|languages|organizational\s+experience|riwayat\s+pekerjaan|pengalaman\s+kerja|pendidikan|keahlian|tentang\s+saya)$/i.test(
+        cleanLine
+      );
+
     const isHeading =
       isLargeHeading ||
       isMediumHeading ||
-      (isLineBold && assembledText.length < 90 && (isCentered || maxFontSize >= 12));
+      isCommonSectionTitle ||
+      (isAllCaps && (isLineBold || maxFontSize >= 10.5)) ||
+      (isLineBold && cleanLine.length < 80 && (isCentered || maxFontSize >= 12 || (/^[A-Z]/.test(cleanLine) && /:$/.test(cleanLine))));
 
-    const listMatch = assembledText.match(/^([•\u2022\u2013\u2014\-*]|\d+[\.\)]|[a-zA-Z][\.\)])\s+/);
+    const listMatch = cleanLine.match(
+      /^([•\u2022\uF0B7\u25CF\u25CB\u25E6\u25AA\u25AB\u2043\u2219\u00B7\u2013\u2014\-*]|\d+[\.\)]|[a-zA-Z][\.\)])\s*/
+    );
     const isListItem = Boolean(listMatch);
     const listBullet = listMatch ? listMatch[1] : undefined;
 
@@ -754,7 +845,7 @@ export function createDocxTable(table: DetectedTable): Table {
     const cells: TableCell[] = [];
     for (let c = 0; c < maxCols; c++) {
       const cellData = rowCells[c];
-      const cellText = cellData ? cellData.text : '';
+      const cellText = sanitizeXmlString(cellData ? cellData.text : '');
 
       cells.push(
         new TableCell({
@@ -793,21 +884,27 @@ export function createDocxTable(table: DetectedTable): Table {
   return new Table({
     width: { size: 100, type: WidthType.PERCENTAGE },
     borders: {
-      top: { style: BorderStyle.SINGLE, size: 1, color: 'D0D7DE' },
-      bottom: { style: BorderStyle.SINGLE, size: 1, color: 'D0D7DE' },
-      left: { style: BorderStyle.SINGLE, size: 1, color: 'D0D7DE' },
-      right: { style: BorderStyle.SINGLE, size: 1, color: 'D0D7DE' },
-      insideHorizontal: { style: BorderStyle.SINGLE, size: 1, color: 'E1E4E8' },
-      insideVertical: { style: BorderStyle.SINGLE, size: 1, color: 'E1E4E8' }
+      top: { style: BorderStyle.SINGLE, size: 4, color: 'D0D7DE' },
+      bottom: { style: BorderStyle.SINGLE, size: 4, color: 'D0D7DE' },
+      left: { style: BorderStyle.SINGLE, size: 4, color: 'D0D7DE' },
+      right: { style: BorderStyle.SINGLE, size: 4, color: 'D0D7DE' },
+      insideHorizontal: { style: BorderStyle.SINGLE, size: 4, color: 'E1E4E8' },
+      insideVertical: { style: BorderStyle.SINGLE, size: 4, color: 'E1E4E8' }
     },
     rows: docxRows
   });
 }
 
 // Create a Paragraph from a group of FormattedLines, preserving word-level formatting
-export function createDocxParagraph(group: FormattedLine[]): Paragraph {
+export function createDocxParagraph(
+  group: FormattedLine[],
+  pageWidthPt = 595,
+  docMarginPt = 36
+): Paragraph {
   const primary = group[0];
   const runs: TextRun[] = [];
+  const rightMarginTwips = Math.round((pageWidthPt - docMarginPt * 2) * 20);
+  let hasRightTab = false;
 
   for (let lIdx = 0; lIdx < group.length; lIdx++) {
     const line = group[lIdx];
@@ -823,7 +920,11 @@ export function createDocxParagraph(group: FormattedLine[]): Paragraph {
     let currFont = 'Calibri';
 
     const flushRun = () => {
-      if (!currentRunText) return;
+      const cleanText = sanitizeXmlString(currentRunText);
+      if (!cleanText) {
+        currentRunText = '';
+        return;
+      }
       let finalSize = Math.round(Math.max(9, Math.min(14, currSize)) * 2);
       let isBold = currBold;
 
@@ -833,11 +934,14 @@ export function createDocxParagraph(group: FormattedLine[]): Paragraph {
       } else if (primary.isMediumHeading) {
         finalSize = Math.min(32, Math.max(26, Math.round(primary.maxFontSize * 2)));
         isBold = true;
+      } else if (primary.isHeading) {
+        finalSize = Math.min(26, Math.max(22, Math.round(primary.maxFontSize * 2)));
+        isBold = true;
       }
 
       runs.push(
         new TextRun({
-          text: currentRunText,
+          text: cleanText,
           bold: isBold,
           italics: currItalic,
           size: finalSize,
@@ -856,15 +960,34 @@ export function createDocxParagraph(group: FormattedLine[]): Paragraph {
         currSize = it.fontSize;
         currFont = it.fontFamily;
       } else {
+        const prev = line.items[i - 1];
+        const gap = it.x - (prev.x + prev.width);
+
+        // Check if there is a significant horizontal gap towards the right margin (like a date)
+        if (gap > 35 && it.x > pageWidthPt * 0.5) {
+          flushRun();
+          runs.push(new TextRun({ text: '\t', font: 'Calibri' }));
+          hasRightTab = true;
+          currentRunText = it.str;
+          currBold = it.isBold;
+          currItalic = it.isItalic;
+          currSize = it.fontSize;
+          currFont = it.fontFamily;
+          continue;
+        }
+
         const isSameFormat =
           it.isBold === currBold &&
           it.isItalic === currItalic &&
           Math.abs(it.fontSize - currSize) <= 1 &&
           it.fontFamily === currFont;
 
-        const prev = line.items[i - 1];
-        const gap = it.x - (prev.x + prev.width);
-        const space = gap > 3 && !/\s$/.test(currentRunText) && !/^\s/.test(it.str) ? ' ' : '';
+        const avgCharWidth = prev.width / (prev.str.length || 1);
+        const needsSpace =
+          gap > Math.max(1.8, avgCharWidth * 0.22) &&
+          !/\s$/.test(currentRunText) &&
+          !/^\s/.test(it.str);
+        const space = needsSpace ? ' ' : '';
 
         if (isSameFormat) {
           currentRunText += space + it.str;
@@ -881,23 +1004,36 @@ export function createDocxParagraph(group: FormattedLine[]): Paragraph {
     flushRun();
   }
 
-  let spacingBefore = 0;
-  let spacingAfter = 90;
+  let spacingBefore = 40;
+  let spacingAfter = 70;
+  let bottomBorder: any = undefined;
+
   if (primary.isLargeHeading) {
     spacingBefore = 240;
-    spacingAfter = 120;
+    spacingAfter = 100;
   } else if (primary.isMediumHeading) {
-    spacingBefore = 160;
+    spacingBefore = 180;
     spacingAfter = 80;
   } else if (primary.isHeading) {
-    spacingBefore = 120;
+    spacingBefore = 160;
     spacingAfter = 60;
+    bottomBorder = {
+      color: 'B0B7C0',
+      size: 6,
+      style: BorderStyle.SINGLE,
+      space: 3
+    };
+  } else if (primary.isListItem) {
+    spacingBefore = 25;
+    spacingAfter = 40;
   }
 
   return new Paragraph({
     alignment: primary.alignment,
     children: runs,
-    indent: primary.isListItem ? { left: 720, hanging: 360 } : undefined,
+    border: bottomBorder ? { bottom: bottomBorder } : undefined,
+    tabStops: hasRightTab ? [{ type: TabStopType.RIGHT, position: rightMarginTwips }] : undefined,
+    indent: primary.isListItem ? { left: 540, hanging: 280 } : undefined,
     spacing: {
       before: spacingBefore,
       after: spacingAfter,
@@ -939,7 +1075,12 @@ export async function convertPdfToDocx(
 
   let pdfDoc: any;
   try {
-    const loadingTask = pdfjsLib.getDocument({ data: dataBuffer });
+    const loadingTask = pdfjsLib.getDocument({
+      data: dataBuffer,
+      cMapUrl: `https://unpkg.com/pdfjs-dist@${pdfjsLib.version}/cmaps/`,
+      cMapPacked: true,
+      standardFontDataUrl: `https://unpkg.com/pdfjs-dist@${pdfjsLib.version}/standard_fonts/`
+    });
     pdfDoc = await loadingTask.promise;
   } catch (err: any) {
     if (err && (err.name === 'PasswordException' || err.code === 1)) {
@@ -1003,6 +1144,10 @@ export async function convertPdfToDocx(
         );
       }
 
+      if (pageChildren.length === 0) {
+        pageChildren.push(new Paragraph({ children: [] }));
+      }
+
       docxSections.push({
         properties: {
           type:
@@ -1044,21 +1189,53 @@ export async function convertPdfToDocx(
 
           if (fn === pdfjsLib.OPS.transform) {
             currentMatrix = args;
-          } else if (fn === pdfjsLib.OPS.paintImageXObject) {
-            const imgId = args[0];
+          } else if (
+            fn === pdfjsLib.OPS.paintImageXObject ||
+            fn === pdfjsLib.OPS.paintInlineImageXObject ||
+            fn === pdfjsLib.OPS.paintImageMaskXObject
+          ) {
+            const imgArg = args[0];
             try {
-              const imgObj = await new Promise<any>((resolve) => {
-                page.objs.get(imgId, (res: any) => resolve(res));
-              });
+              let imgObj: any = null;
 
-              if (imgObj && imgObj.width > 0 && imgObj.height > 0) {
+              if (typeof imgArg === 'object' && imgArg !== null) {
+                imgObj = imgArg;
+              } else if (typeof imgArg === 'string') {
+                imgObj = await new Promise<any>((resolve) => {
+                  const timer = setTimeout(() => resolve(null), 1500);
+                  let settled = false;
+                  const safeResolve = (val: any) => {
+                    if (!settled) {
+                      settled = true;
+                      clearTimeout(timer);
+                      resolve(val);
+                    }
+                  };
+
+                  try {
+                    if (page.objs && typeof page.objs.get === 'function') {
+                      page.objs.get(imgArg, (res: any) => safeResolve(res));
+                    } else if (page.commonObjs && typeof page.commonObjs.get === 'function') {
+                      page.commonObjs.get(imgArg, (res: any) => safeResolve(res));
+                    } else {
+                      safeResolve(null);
+                    }
+                  } catch {
+                    safeResolve(null);
+                  }
+                });
+              }
+
+              if (imgObj) {
                 const pngBytes = await rawPdfImageToPngBytes(imgObj);
-                if (pngBytes) {
-                  const widthPt = Math.abs(currentMatrix[0]) || imgObj.width * 0.75;
-                  const heightPt = Math.abs(currentMatrix[3]) || imgObj.height * 0.75;
+                if (pngBytes && pngBytes.length > 0) {
+                  const rawW = Math.abs(currentMatrix[0]) || imgObj.width * 0.75;
+                  const rawH = Math.abs(currentMatrix[3]) || imgObj.height * 0.75;
+                  const widthPt = Math.max(16, Number.isFinite(rawW) ? rawW : 50);
+                  const heightPt = Math.max(16, Number.isFinite(rawH) ? rawH : 50);
                   extractedImages.push({
-                    x: currentMatrix[4],
-                    y: currentMatrix[5],
+                    x: currentMatrix[4] ?? 0,
+                    y: currentMatrix[5] ?? 0,
                     widthPt,
                     heightPt,
                     pngBytes
@@ -1141,7 +1318,7 @@ export async function convertPdfToDocx(
       const flowItems: InterleavedItem[] = [
         ...remainingLines.map((l) => ({ type: 'line' as const, y: l.y, data: l })),
         ...detectedTables.map((t) => ({ type: 'table' as const, y: t.y, data: t })),
-        ...extractedImages.map((img) => ({ type: 'image' as const, y: img.y, data: img }))
+        ...extractedImages.map((img) => ({ type: 'image' as const, y: img.y + img.heightPt, data: img }))
       ];
 
       flowItems.sort((a, b) => b.y - a.y);
@@ -1150,7 +1327,7 @@ export async function convertPdfToDocx(
 
       const flushParagraphGroup = () => {
         if (currentParagraphGroup.length === 0) return;
-        const p = createDocxParagraph(currentParagraphGroup);
+        const p = createDocxParagraph(currentParagraphGroup, pageWidthPt, docMarginPt);
         const groupWords = currentParagraphGroup
           .map((l) => l.text)
           .join(' ')
@@ -1177,8 +1354,8 @@ export async function convertPdfToDocx(
             widthPx = availWidthPx;
             heightPx = Math.max(20, Math.round(heightPx * scale));
           }
-          widthPx = Math.max(16, widthPx);
-          heightPx = Math.max(16, heightPx);
+          widthPx = Math.max(16, Number.isFinite(widthPx) ? widthPx : 50);
+          heightPx = Math.max(16, Number.isFinite(heightPx) ? heightPx : 50);
 
           let alignment: (typeof AlignmentType)[keyof typeof AlignmentType] = AlignmentType.LEFT;
           const imgCenterX = img.x + img.widthPt / 2;
@@ -1193,19 +1370,21 @@ export async function convertPdfToDocx(
             alignment = AlignmentType.RIGHT;
           }
 
-          pageChildren.push(
-            new Paragraph({
-              alignment,
-              children: [
-                new ImageRun({
-                  data: img.pngBytes,
-                  transformation: { width: widthPx, height: heightPx },
-                  type: 'png'
-                })
-              ],
-              spacing: { before: 80, after: 120 }
-            })
-          );
+          if (img.pngBytes && img.pngBytes.length > 0) {
+            pageChildren.push(
+              new Paragraph({
+                alignment,
+                children: [
+                  new ImageRun({
+                    data: img.pngBytes,
+                    transformation: { width: widthPx, height: heightPx },
+                    type: 'png'
+                  })
+                ],
+                spacing: { before: 80, after: 120 }
+              })
+            );
+          }
         } else {
           // item.type === 'line'
           const curr = item.data;
@@ -1219,15 +1398,19 @@ export async function convertPdfToDocx(
           const vGap = Math.abs(prev.y - curr.y);
           const isPrevStandalone =
             prev.isHeading ||
+            prev.isListItem ||
             prev.alignment !== AlignmentType.LEFT ||
-            /:$/.test(prev.text) ||
-            prev.lineWidth < (pageWidthPt - docMarginPt * 2) * 0.55;
+            /:$/.test(prev.text.trim()) ||
+            prev.lineWidth < (pageWidthPt - docMarginPt * 2) * 0.55 ||
+            (prev.isBold && !curr.isBold);
 
           const isCurrStandalone =
             curr.isHeading ||
-            curr.alignment !== AlignmentType.LEFT ||
             curr.isListItem ||
-            vGap > curr.maxFontSize * 2.1;
+            curr.alignment !== AlignmentType.LEFT ||
+            vGap > curr.maxFontSize * 1.45 ||
+            (!prev.isBold && curr.isBold && curr.text.length < 80) ||
+            Math.abs(curr.minX - prev.minX) > 18;
 
           if (isPrevStandalone || isCurrStandalone) {
             flushParagraphGroup();
@@ -1239,6 +1422,10 @@ export async function convertPdfToDocx(
       }
 
       flushParagraphGroup();
+    }
+
+    if (pageChildren.length === 0) {
+      pageChildren.push(new Paragraph({ children: [] }));
     }
 
     const marginTwips = Math.round(docMarginPt * 20);
