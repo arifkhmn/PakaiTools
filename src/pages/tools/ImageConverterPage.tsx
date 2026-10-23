@@ -116,7 +116,7 @@ export const ImageConverterPage: React.FC = () => {
       zip.file(`${baseName}.${item.result.extension}`, item.result.blob);
     });
 
-    const zipBlob = await zip.generateAsync({ type: 'blob' });
+    const zipBlob = await zip.generateAsync({ type: 'blob', mimeType: 'application/zip' });
     downloadBlob(zipBlob, 'pakaitools-hasil-konversi.zip');
   };
 

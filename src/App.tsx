@@ -2,6 +2,7 @@ import React, { Suspense, lazy, useEffect } from 'react';
 import { BrowserRouter, Routes, Route, useLocation } from 'react-router-dom';
 import { Header } from './components/layout/Header';
 import { Footer } from './components/layout/Footer';
+import { InAppBrowserNotice } from './components/layout/InAppBrowserNotice';
 
 // Eagerly loaded core page for instant hero display
 import { HomePage } from './pages/HomePage';
@@ -72,6 +73,7 @@ export const App: React.FC = () => {
   return (
     <BrowserRouter>
       <ScrollToTop />
+      <InAppBrowserNotice />
       <Header />
       <main style={{ flex: 1 }}>
         <Suspense fallback={<PageLoader />}>

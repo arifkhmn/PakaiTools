@@ -133,7 +133,7 @@ export const ImageCompressorPage: React.FC = () => {
       zip.file(`${baseName}-pakaitools-min${targetExt}`, item.result.blob);
     });
 
-    const zipBlob = await zip.generateAsync({ type: 'blob' });
+    const zipBlob = await zip.generateAsync({ type: 'blob', mimeType: 'application/zip' });
     downloadBlob(zipBlob, 'pakaitools-kompresi.zip');
   };
 

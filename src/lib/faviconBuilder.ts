@@ -156,7 +156,7 @@ export async function generateFaviconPackage(file: File): Promise<FaviconPackage
 
     zip.file('README.txt', `Paket Favicon Dibuat oleh PakaiTools (https://pakaitools.id)\n\nSilakan letakkan semua file ikon di folder root publik website kamu (biasanya folder /public atau public_html), lalu tempelkan kode HTML berikut ke dalam bagian <head> file HTML kamu:\n\n${htmlCode}\n`);
 
-    const zipBlob = await zip.generateAsync({ type: 'blob' });
+    const zipBlob = await zip.generateAsync({ type: 'blob', mimeType: 'application/zip' });
 
     return {
       items,
